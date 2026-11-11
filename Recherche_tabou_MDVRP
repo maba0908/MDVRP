@@ -1,0 +1,859 @@
+
+# MDVRP : DEUX DÉPÔTS + RECHERCHE TABOU
+
+
+from collections import Counter
+from copy import deepcopy
+from math import hypot
+from random import Random
+from time import perf_counter
+
+
+
+# 1. DONNÉES DE NOTRE PETITE INSTANCE DE TEST
+
+
+INSTANCE = {
+    "nom": "Exemple_6_clients",
+
+    "depots": {
+        "D1": (0, 0),
+        "D2": (10, 0),
+    },
+
+    "clients": {
+        "C1": {"position": (1, 2), "demande": 2},
+        "C2": {"position": (2, 1), "demande": 3},
+        "C3": {"position": (3, 3), "demande": 2},
+        "C4": {"position": (8, 1), "demande": 2},
+        "C5": {"position": (9, 3), "demande": 3},
+        "C6": {"position": (7, 2), "demande": 2},
+    },
+
+    "capacite": 10,
+
+    "camions_par_depot": {
+        "D1": 1,
+        "D2": 1,
+    },
+}
+
+
+
+# 2. PRÉPARER LES DONNÉES ET LES DISTANCES
+
+
+def preparer_instance(instance):
+    """Vérifier les données et calculer la matrice des distances."""
+
+    instance = deepcopy(instance)
+
+    depots = instance["depots"]
+    clients = instance["clients"]
+    capacite = instance["capacite"]
+    flotte = instance["camions_par_depot"]
+
+    if not depots or not clients:
+        raise ValueError("Il faut au moins un dépôt et un client.")
+
+    if set(depots) & set(clients):
+        raise ValueError(
+            "Les dépôts et les clients doivent avoir des noms différents."
+        )
+
+    if capacite <= 0:
+        raise ValueError("La capacité doit être positive.")
+
+    if set(flotte) != set(depots):
+        raise ValueError("La flotte doit être définie pour chaque dépôt.")
+
+    for nombre in flotte.values():
+        if not isinstance(nombre, int) or nombre < 0:
+            raise ValueError(
+                "Le nombre de camions doit être un entier positif ou nul."
+            )
+
+    for client, informations in clients.items():
+        demande = informations["demande"]
+
+        if demande <= 0:
+            raise ValueError(f"Demande incorrecte pour {client}.")
+
+        if demande > capacite:
+            raise ValueError(
+                f"La demande de {client} dépasse la capacité d'un camion."
+            )
+
+    demande_totale = sum(
+        informations["demande"]
+        for informations in clients.values()
+    )
+
+    capacite_totale = capacite * sum(flotte.values())
+
+    if demande_totale > capacite_totale:
+        raise ValueError("La capacité totale de la flotte est insuffisante.")
+
+    positions = dict(depots)
+
+    for client, informations in clients.items():
+        positions[client] = informations["position"]
+
+    distances = {
+        (i, j): hypot(
+            positions[i][0] - positions[j][0],
+            positions[i][1] - positions[j][1],
+        )
+        for i in positions
+        for j in positions
+    }
+
+    instance["positions"] = positions
+    instance["distances"] = distances
+
+    return instance
+
+
+
+# 3. CALCULER LES CHARGES ET LES COÛTS
+
+
+def charge_tournee(instance, tournee):
+    """Calculer la quantité totale livrée dans une tournée."""
+
+    return sum(
+        instance["clients"][client]["demande"]
+        for client in tournee
+    )
+
+
+def cout_tournee(instance, depot, tournee):
+    """Calculer la distance, départ et retour au dépôt compris."""
+
+    trajet = [depot] + tournee + [depot]
+
+    return sum(
+        instance["distances"][depart, arrivee]
+        for depart, arrivee in zip(trajet, trajet[1:])
+    )
+
+
+def cout_solution(instance, solution):
+    """Additionner les distances de toutes les tournées."""
+
+    return sum(
+        cout_tournee(instance, depot, tournee)
+        for depot, tournees in solution.items()
+        for tournee in tournees
+    )
+
+
+
+# 4. VÉRIFIER UNE SOLUTION
+
+
+def verifier_solution(instance, solution, afficher=False):
+    """Contrôler les clients, les capacités et les véhicules."""
+
+    erreurs = []
+
+    if set(solution) != set(instance["depots"]):
+        erreurs.append("Les dépôts de la solution sont incorrects.")
+    else:
+        clients_visites = []
+
+        for depot, tournees in solution.items():
+
+            # Les tournées vides correspondent à des camions inutilisés.
+            nombre_utilises = sum(bool(tournee) for tournee in tournees)
+
+            if nombre_utilises > instance["camions_par_depot"][depot]:
+                erreurs.append(f"Trop de camions utilisés pour {depot}.")
+
+            for tournee in tournees:
+
+                inconnus = [
+                    client
+                    for client in tournee
+                    if client not in instance["clients"]
+                ]
+
+                if inconnus:
+                    erreurs.append(f"Clients inconnus : {inconnus}.")
+                    continue
+
+                if charge_tournee(instance, tournee) > instance["capacite"]:
+                    erreurs.append(
+                        f"Capacité dépassée au dépôt {depot} : {tournee}."
+                    )
+
+                clients_visites.extend(tournee)
+
+        visites_attendues = Counter({
+            client: 1
+            for client in instance["clients"]
+        })
+
+        if Counter(clients_visites) != visites_attendues:
+            erreurs.append(
+                "Certains clients sont absents ou livrés plusieurs fois."
+            )
+
+    if afficher:
+        if erreurs:
+            for erreur in erreurs:
+                print("Erreur :", erreur)
+        else:
+            print("Solution valide.")
+
+    return not erreurs
+
+
+# Le dépôt de départ et de retour est fixé par la clé du dictionnaire.
+# Les listes de tournées contiennent uniquement les clients.
+
+
+
+# 5. CONSTRUIRE UNE SOLUTION INITIALE
+
+
+def construire_solution_initiale(instance, essais_max=100, graine=42):
+    """
+    Insérer les clients à la position la moins coûteuse.
+
+    En cas de blocage, essayer un autre ordre de clients.
+    """
+
+    hasard = Random(graine)
+    clients = instance["clients"]
+    distances = instance["distances"]
+    capacite = instance["capacite"]
+
+    for essai in range(essais_max):
+
+        solution = {
+            depot: [
+                []
+                for _ in range(instance["camions_par_depot"][depot])
+            ]
+            for depot in instance["depots"]
+        }
+
+        ordre = list(clients)
+
+        if essai == 0:
+            # Premier essai : les plus grosses demandes d'abord.
+            ordre.sort(
+                key=lambda client: clients[client]["demande"],
+                reverse=True,
+            )
+        else:
+            hasard.shuffle(ordre)
+
+        construction_reussie = True
+
+        for client in ordre:
+
+            meilleur_choix = None
+            meilleure_variation = float("inf")
+
+            for depot, tournees in solution.items():
+                for numero, tournee in enumerate(tournees):
+
+                    nouvelle_charge = (
+                        charge_tournee(instance, tournee)
+                        + clients[client]["demande"]
+                    )
+
+                    if nouvelle_charge > capacite:
+                        continue
+
+                    trajet = [depot] + tournee + [depot]
+
+                    for position in range(len(tournee) + 1):
+
+                        avant = trajet[position]
+                        apres = trajet[position + 1]
+
+                        # Retirer l'arc avant → après.
+                        # Ajouter avant → client → après.
+                        variation = (
+                            distances[avant, client]
+                            + distances[client, apres]
+                            - distances[avant, apres]
+                        )
+
+                        if variation < meilleure_variation:
+                            meilleure_variation = variation
+                            meilleur_choix = (
+                                depot,
+                                numero,
+                                position,
+                            )
+
+            if meilleur_choix is None:
+                construction_reussie = False
+                break
+
+            depot, numero, position = meilleur_choix
+            solution[depot][numero].insert(position, client)
+
+        if construction_reussie:
+            if verifier_solution(instance, solution):
+                return solution
+
+    raise RuntimeError(
+        "La construction initiale a échoué après plusieurs essais. "
+        "Cela ne prouve pas que l'instance est impossible."
+    )
+
+
+
+# 6. VOISINAGE : DÉPLACER UN CLIENT
+
+
+def voisins_deplacement(instance, solution):
+    """Déplacer un client vers une autre tournée."""
+
+    capacite = instance["capacite"]
+    clients = instance["clients"]
+
+    for depot_a, tournees_a in solution.items():
+        for numero_a, tournee_a in enumerate(tournees_a):
+            for position_a, client in enumerate(tournee_a):
+
+                origine = (depot_a, numero_a)
+
+                for depot_b, tournees_b in solution.items():
+                    for numero_b, tournee_b in enumerate(tournees_b):
+
+                        destination = (depot_b, numero_b)
+
+                        if origine == destination:
+                            continue
+
+                        charge_b = (
+                            charge_tournee(instance, tournee_b)
+                            + clients[client]["demande"]
+                        )
+
+                        if charge_b > capacite:
+                            continue
+
+                        for position_b in range(len(tournee_b) + 1):
+
+                            candidate = deepcopy(solution)
+
+                            candidate[depot_a][numero_a].pop(position_a)
+
+                            candidate[depot_b][numero_b].insert(
+                                position_b,
+                                client,
+                            )
+
+                            yield {
+                                "solution": candidate,
+                                "type": "déplacement",
+                                "cles_testees": [
+                                    ("affectation", client, destination)
+                                ],
+                                "cles_interdites": [
+                                    ("affectation", client, origine)
+                                ],
+                            }
+
+
+# 7. VOISINAGE : ÉCHANGER DEUX CLIENTS
+
+
+def voisins_echange(instance, solution):
+    """Échanger deux clients de deux tournées différentes."""
+
+    capacite = instance["capacite"]
+    clients = instance["clients"]
+
+    identifiants = [
+        (depot, numero)
+        for depot, tournees in solution.items()
+        for numero in range(len(tournees))
+    ]
+
+    for index, origine_a in enumerate(identifiants):
+        for origine_b in identifiants[index + 1:]:
+
+            depot_a, numero_a = origine_a
+            depot_b, numero_b = origine_b
+
+            tournee_a = solution[depot_a][numero_a]
+            tournee_b = solution[depot_b][numero_b]
+
+            charge_a = charge_tournee(instance, tournee_a)
+            charge_b = charge_tournee(instance, tournee_b)
+
+            for position_a, client_a in enumerate(tournee_a):
+                for position_b, client_b in enumerate(tournee_b):
+
+                    nouvelle_charge_a = (
+                        charge_a
+                        - clients[client_a]["demande"]
+                        + clients[client_b]["demande"]
+                    )
+
+                    nouvelle_charge_b = (
+                        charge_b
+                        - clients[client_b]["demande"]
+                        + clients[client_a]["demande"]
+                    )
+
+                    if (
+                        nouvelle_charge_a > capacite
+                        or nouvelle_charge_b > capacite
+                    ):
+                        continue
+
+                    candidate = deepcopy(solution)
+
+                    candidate[depot_a][numero_a][position_a] = client_b
+                    candidate[depot_b][numero_b][position_b] = client_a
+
+                    yield {
+                        "solution": candidate,
+                        "type": "échange",
+                        "cles_testees": [
+                            ("affectation", client_a, origine_b),
+                            ("affectation", client_b, origine_a),
+                        ],
+                        "cles_interdites": [
+                            ("affectation", client_a, origine_a),
+                            ("affectation", client_b, origine_b),
+                        ],
+                    }
+
+
+
+# 8. VOISINAGE : INVERSER UN SEGMENT D'UNE TOURNÉE
+
+
+def voisins_inversion(instance, solution):
+    """Modifier l'ordre des visites par une inversion de segment."""
+
+    for depot, tournees in solution.items():
+        for numero, tournee in enumerate(tournees):
+
+            for debut in range(len(tournee) - 1):
+                for fin in range(debut + 1, len(tournee)):
+
+                    candidate = deepcopy(solution)
+
+                    candidate[depot][numero] = (
+                        tournee[:debut]
+                        + list(reversed(tournee[debut:fin + 1]))
+                        + tournee[fin + 1:]
+                    )
+
+                    # On identifie les arêtes retirées et ajoutées.
+                    # Les distances de cet exemple sont symétriques.
+                    trajet = [depot] + tournee + [depot]
+
+                    a = trajet[debut]
+                    b = trajet[debut + 1]
+                    c = trajet[fin + 1]
+                    d = trajet[fin + 2]
+
+                    def cle_arete(i, j):
+                        return (
+                            "arete",
+                            depot,
+                            numero,
+                            tuple(sorted((i, j))),
+                        )
+
+                    yield {
+                        "solution": candidate,
+                        "type": "inversion",
+                        "cles_testees": [
+                            cle_arete(a, c),
+                            cle_arete(b, d),
+                        ],
+                        "cles_interdites": [
+                            cle_arete(a, b),
+                            cle_arete(c, d),
+                        ],
+                    }
+
+
+
+# 9. REGROUPER LES VOISINS
+
+
+def generer_voisins(instance, solution):
+    """
+    Fournir les voisins un par un.
+    Cela évite de tous les conserver en mémoire.
+    """
+
+    yield from voisins_deplacement(instance, solution)
+    yield from voisins_echange(instance, solution)
+    yield from voisins_inversion(instance, solution)
+
+
+
+# 10. RECHERCHE TABOU
+
+
+def recherche_tabou(
+    instance,
+    solution_depart,
+    iterations_max=300,
+    duree_tabou=7,
+    stagnation_max=80,
+    temps_max=10,
+):
+    """Explorer les voisins et conserver la meilleure solution."""
+
+    if not verifier_solution(instance, solution_depart):
+        raise ValueError("La solution de départ est invalide.")
+
+    courante = deepcopy(solution_depart)
+    meilleure = deepcopy(solution_depart)
+
+    cout_courant = cout_solution(instance, courante)
+    meilleur_cout = cout_courant
+
+    liste_tabou = {}
+    sans_amelioration = 0
+
+    debut_calcul = perf_counter()
+    temps_meilleure = 0.0
+
+    raison_arret = "Nombre maximal d'itérations atteint"
+
+    historique = [{
+        "iteration": 0,
+        "temps": 0.0,
+        "cout_courant": cout_courant,
+        "meilleur_cout": meilleur_cout,
+        "mouvement": "départ",
+    }]
+
+    for iteration in range(1, iterations_max + 1):
+
+        if perf_counter() - debut_calcul >= temps_max:
+            raison_arret = "Temps maximal atteint"
+            break
+
+        liste_tabou = {
+            cle: expiration
+            for cle, expiration in liste_tabou.items()
+            if expiration >= iteration
+        }
+
+        choix = None
+        cout_choix = float("inf")
+
+        # Conserver aussi le meilleur voisin, même tabou.
+        # Il servira si tous les mouvements sont interdits.
+        meilleur_voisin = None
+        cout_meilleur_voisin = float("inf")
+
+        temps_depasse = False
+
+        for voisin in generer_voisins(instance, courante):
+
+            if perf_counter() - debut_calcul >= temps_max:
+                temps_depasse = True
+                break
+
+            cout = cout_solution(instance, voisin["solution"])
+
+            if cout < cout_meilleur_voisin:
+                meilleur_voisin = voisin
+                cout_meilleur_voisin = cout
+
+            est_tabou = any(
+                cle in liste_tabou
+                for cle in voisin["cles_testees"]
+            )
+
+            # Aspiration : une amélioration du meilleur résultat
+            # peut être acceptée malgré une interdiction.
+            aspiration = cout < meilleur_cout - 1e-9
+
+            if est_tabou and not aspiration:
+                continue
+
+            if cout < cout_choix:
+                choix = voisin
+                cout_choix = cout
+
+        if meilleur_voisin is None:
+            raison_arret = (
+                "Temps maximal atteint"
+                if temps_depasse
+                else "Aucun voisin réalisable"
+            )
+            break
+
+        # Si tous les voisins sont tabous, lever les interdictions.
+        if choix is None:
+            liste_tabou.clear()
+            choix = meilleur_voisin
+            cout_choix = cout_meilleur_voisin
+
+        courante = choix["solution"]
+        cout_courant = cout_choix
+
+        # Contrôle de la solution réellement retenue.
+        if not verifier_solution(instance, courante):
+            raise RuntimeError("Un mouvement a produit une solution invalide.")
+
+        for cle in choix["cles_interdites"]:
+            liste_tabou[cle] = iteration + duree_tabou
+
+        if cout_courant < meilleur_cout - 1e-9:
+            meilleure = deepcopy(courante)
+            meilleur_cout = cout_courant
+            temps_meilleure = perf_counter() - debut_calcul
+            sans_amelioration = 0
+        else:
+            sans_amelioration += 1
+
+        historique.append({
+            "iteration": iteration,
+            "temps": perf_counter() - debut_calcul,
+            "cout_courant": cout_courant,
+            "meilleur_cout": meilleur_cout,
+            "mouvement": choix["type"],
+        })
+
+        if temps_depasse:
+            raison_arret = "Temps maximal atteint"
+            break
+
+        if sans_amelioration >= stagnation_max:
+            raison_arret = "Stagnation"
+            break
+
+    return {
+        "solution": meilleure,
+        "cout": meilleur_cout,
+        "temps_total": perf_counter() - debut_calcul,
+        "temps_meilleure": temps_meilleure,
+        "iterations": len(historique) - 1,
+        "raison_arret": raison_arret,
+        "historique": historique,
+    }
+
+
+
+# 11. AFFICHER LES TOURNÉES
+
+
+def afficher_solution(instance, solution, titre):
+
+    print(f"\n{titre}")
+    print("-" * 55)
+
+    for depot, tournees in solution.items():
+        for numero, tournee in enumerate(tournees, start=1):
+
+            if not tournee:
+                print(f"{depot} — camion {numero} : inutilisé")
+                continue
+
+            trajet = [depot] + tournee + [depot]
+
+            print(" → ".join(trajet))
+            print(
+                f"  Charge : "
+                f"{charge_tournee(instance, tournee)}"
+                f"/{instance['capacite']}"
+                f" | Distance : "
+                f"{cout_tournee(instance, depot, tournee):.2f}"
+            )
+
+    print(f"Distance totale : {cout_solution(instance, solution):.2f}")
+
+
+
+# 12. GRAPHIQUES
+
+
+def afficher_graphiques(instance, solution_initiale, resultat):
+
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print(
+            "\nPour les graphiques, exécute dans une autre cellule :"
+            "\n%pip install matplotlib"
+            "\nPuis relance ce programme."
+        )
+        return
+
+    def tracer_tournees(ax, solution, titre):
+
+        couleurs = ["tab:blue", "tab:orange", "tab:green", "tab:red"]
+
+        for indice, (depot, tournees) in enumerate(solution.items()):
+
+            couleur = couleurs[indice % len(couleurs)]
+            x, y = instance["depots"][depot]
+
+            ax.scatter(
+                x, y,
+                marker="s",
+                s=150,
+                color=couleur,
+                label=depot,
+                zorder=3,
+            )
+
+            ax.annotate(
+                depot, (x, y),
+                xytext=(5, 7),
+                textcoords="offset points",
+            )
+
+            for tournee in tournees:
+
+                if not tournee:
+                    continue
+
+                trajet = [depot] + tournee + [depot]
+
+                xs = [
+                    instance["positions"][point][0]
+                    for point in trajet
+                ]
+
+                ys = [
+                    instance["positions"][point][1]
+                    for point in trajet
+                ]
+
+                ax.plot(
+                    xs, ys,
+                    color=couleur,
+                    marker="o",
+                    alpha=0.75,
+                )
+
+        for client, informations in instance["clients"].items():
+
+            x, y = informations["position"]
+
+            ax.annotate(
+                client, (x, y),
+                xytext=(5, 5),
+                textcoords="offset points",
+            )
+
+        ax.set_title(titre)
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(alpha=0.3)
+        ax.legend()
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    tracer_tournees(
+        axes[0],
+        solution_initiale,
+        f"Départ : {cout_solution(instance, solution_initiale):.2f}",
+    )
+
+    tracer_tournees(
+        axes[1],
+        resultat["solution"],
+        f"Après recherche tabou : {resultat['cout']:.2f}",
+    )
+
+    plt.tight_layout()
+    plt.show()
+
+    historique = resultat["historique"]
+
+    plt.figure(figsize=(9, 4))
+
+    plt.plot(
+        [ligne["iteration"] for ligne in historique],
+        [ligne["cout_courant"] for ligne in historique],
+        label="Coût courant",
+        alpha=0.6,
+    )
+
+    plt.plot(
+        [ligne["iteration"] for ligne in historique],
+        [ligne["meilleur_cout"] for ligne in historique],
+        label="Meilleur coût",
+        linewidth=2,
+    )
+
+    plt.xlabel("Itération")
+    plt.ylabel("Distance")
+    plt.title("Évolution de la recherche tabou")
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+
+# 13. EXÉCUTION COMPLÈTE
+
+
+instance = preparer_instance(INSTANCE)
+
+print("Instance :", instance["nom"])
+print("Clients :", len(instance["clients"]))
+print("Dépôts :", len(instance["depots"]))
+print("Capacité :", instance["capacite"])
+
+solution_initiale = construire_solution_initiale(
+    instance,
+    essais_max=100,
+    graine=42,
+)
+
+resultat = recherche_tabou(
+    instance,
+    solution_initiale,
+    iterations_max=300,
+    duree_tabou=7,
+    stagnation_max=80,
+    temps_max=10,
+)
+
+afficher_solution(
+    instance,
+    solution_initiale,
+    "SOLUTION INITIALE",
+)
+
+afficher_solution(
+    instance,
+    resultat["solution"],
+    "MEILLEURE SOLUTION TROUVÉE",
+)
+
+print("\nVÉRIFICATION FINALE")
+verifier_solution(instance, resultat["solution"], afficher=True)
+
+cout_initial = cout_solution(instance, solution_initiale)
+
+amelioration = (
+    100 * (cout_initial - resultat["cout"]) / cout_initial
+    if cout_initial > 0
+    else 0.0
+)
+
+print(f"\nAmélioration : {amelioration:.2f} %")
+print(f"Nombre d'itérations : {resultat['iterations']}")
+print(f"Temps de recherche : {resultat['temps_total']:.4f} s")
+print(f"Temps jusqu'au meilleur résultat : {resultat['temps_meilleure']:.4f} s")
+print("Raison de l'arrêt :", resultat["raison_arret"])
+
+afficher_graphiques(instance, solution_initiale, resultat)
+
